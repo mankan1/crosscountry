@@ -1,0 +1,12 @@
+# railway.toml — tells Railway how to deploy
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "node server.js"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[volumes]]
+# Persists the SQLite database across deployments
+mountPath = "/data"

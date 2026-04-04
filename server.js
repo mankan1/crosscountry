@@ -80,6 +80,7 @@ app.use(cors({
 // ── Raw body for Stripe webhook (must come before json parser) ──
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Health check ───────────────────────────────────────────
 app.get('/', (req, res) => {

@@ -60,6 +60,26 @@ db.exec(`
 
 console.log(`✅ Database ready at ${DB_PATH}`);
 
+// ── Serve frontend HTML from /public folder ────────────────
+// Put livermore-copilot.html inside lp-backend/public/
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Root redirect → the HTML file
+app.get('/', (req, res) => {
+  const htmlPath = path.join(__dirname, 'public', 'livermore-copilot.html');
+  const fs = require('fs');
+  if (fs.existsSync(htmlPath)) {
+    res.sendFile(htmlPath);
+  } else {
+    res.json({
+      status: 'ok',
+      service: 'Livermore Co-Pilot Backend',
+      time: new Date().toISOString(),
+      note: 'Put livermore-copilot.html in the public/ folder to serve the frontend',
+    });
+  }
+});
+
 // ── CORS — allow your frontend domain ──────────────────────
 const allowedOrigins = [
   FRONTEND_URL,
@@ -80,10 +100,9 @@ app.use(cors({
 // ── Raw body for Stripe webhook (must come before json parser) ──
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Health check ───────────────────────────────────────────
-app.get('/', (req, res) => {
+// ── Health check (API only) ────────────────────────────────
+app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Livermore Co-Pilot Backend', time: new Date().toISOString() });
 });
 

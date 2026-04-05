@@ -201,64 +201,8 @@ app.get('/api/yahoo', async (req, res) => {
   }
 });
 
-// ── Token verification helper ──────────────────────────────
-// Returns { email, name } if valid, null if invalid
-// Soft-fails if GOOGLE_CLIENT_ID not configured (allows dev mode)
-async function verifyGoogleToken(token, email) {
-  // Mock tokens (demo/file:// mode) — always allow
-  if (!token || token.startsWith('mock_')) return { email, name: email };
-
-  // If no Google Client ID configured, skip verification (dev mode)
-  if (!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID.includes('YOUR_')) {
-    console.warn('⚠️  GOOGLE_CLIENT_ID not set — skipping token verification');
-    return { email, name: email };
-  }
-
-  // Try Google library verification first
-  try {
-    const ticket  = await googleClient.verifyIdToken({
-      idToken:  token,
-      audience: GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    return { email: payload.email, name: payload.name };
-  } catch(e) {
-    // Library verification failed — try manual JWT decode as fallback
-    // (handles clock skew, implicit flow tokens, etc.)
-    try {
-      const parts   = token.split('.');
-      if (parts.length !== 3) throw new Error('not a JWT');
-      const payload = JSON.parse(Buffer.from(
-        parts[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64'
-      ).toString('utf8'));
-
-      // Check expiry (allow 5 min clock skew)
-      const now = Math.floor(Date.now() / 1000);
-      if (payload.exp && payload.exp < now - 300) {
-        throw new Error('token expired');
-      }
-      // Check audience
-      if (payload.aud !== GOOGLE_CLIENT_ID) {
-        throw new Error('wrong audience');
-      }
-      // Check issuer
-      if (!['accounts.google.com', 'https://accounts.google.com'].includes(payload.iss)) {
-        throw new Error('wrong issuer');
-      }
-      // Email must match what was sent
-      if (email && payload.email !== email) {
-        throw new Error('email mismatch');
-      }
-
-      console.log(`✅ Token verified via JWT decode for ${payload.email}`);
-      return { email: payload.email, name: payload.name };
-    } catch(e2) {
-      console.warn('Token verification failed:', e.message, '/', e2.message);
-      // In production with GOOGLE_CLIENT_ID set, reject
-      return null;
-    }
-  }
-}
+// ══════════════════════════════════════════════════════════
+//  POST /api/pro-status
 //  Called on every user login to check Stripe subscription
 //  Body: { email, token }
 //  Returns: { isPro, planName, renewsAt }
@@ -267,12 +211,12 @@ app.post('/api/pro-status', async (req, res) => {
   const { email, token } = req.body;
   if (!email) return res.status(400).json({ error: 'email required' });
 
-  // Verify token
-  if (token && !token.startsWith('mock_')) {
-    const verified = await verifyGoogleToken(token, email);
-    if (!verified && GOOGLE_CLIENT_ID && !GOOGLE_CLIENT_ID.includes('YOUR_')) {
-      console.warn('pro-status: token rejected for', email);
-      // Don't hard-block pro-status — return cached value instead
+  // Optionally verify Google token
+  if (token && GOOGLE_CLIENT_ID && !token.startsWith('mock_')) {
+    try {
+      await googleClient.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
+    } catch(e) {
+      return res.status(401).json({ error: 'invalid token' });
     }
   }
 
@@ -322,11 +266,12 @@ app.post('/api/create-checkout', async (req, res) => {
   const { email, priceId, token, successUrl, cancelUrl } = req.body;
   if (!email || !priceId) return res.status(400).json({ error: 'email and priceId required' });
 
-  // Verify Google token — use robust helper that handles clock skew
-  if (token && !token.startsWith('mock_')) {
-    const verified = await verifyGoogleToken(token, email);
-    if (!verified && GOOGLE_CLIENT_ID && !GOOGLE_CLIENT_ID.includes('YOUR_')) {
-      return res.status(401).json({ error: 'invalid token — please sign in again' });
+  // Verify Google token
+  if (token && GOOGLE_CLIENT_ID && !token.startsWith('mock_')) {
+    try {
+      await googleClient.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
+    } catch(e) {
+      return res.status(401).json({ error: 'invalid token' });
     }
   }
 
@@ -458,10 +403,9 @@ app.post('/api/cancel-subscription', async (req, res) => {
 
   // Verify token
   if (token && GOOGLE_CLIENT_ID && !token.startsWith('mock_')) {
-    const verified = await verifyGoogleToken(token, email);
-    if (!verified && GOOGLE_CLIENT_ID && !GOOGLE_CLIENT_ID.includes('YOUR_')) {
-      return res.status(401).json({ error: 'invalid token' });
-    }
+    try {
+      await googleClient.verifyIdToken({ idToken: token, audience: GOOGLE_CLIENT_ID });
+    } catch(e) { return res.status(401).json({ error: 'invalid token' }); }
   }
 
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);

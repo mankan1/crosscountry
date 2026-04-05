@@ -260,33 +260,26 @@ app.post('/api/pro-status', async (req, res) => {
     user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
   }
 
-  // Live-check Stripe for active or trialing subscription
+  // Live-check Stripe for active subscription
   let isPro = false, planName = null, renewsAt = null;
   try {
     if (user.stripe_customer) {
-      // Check both 'active' AND 'trialing' — trial period counts as pro
-      const [activeSubs, trialSubs] = await Promise.all([
-        stripe.subscriptions.list({ customer: user.stripe_customer, status: 'active',   limit: 1 }),
-        stripe.subscriptions.list({ customer: user.stripe_customer, status: 'trialing', limit: 1 }),
-      ]);
-      const sub = activeSubs.data[0] || trialSubs.data[0];
-      if (sub) {
-        isPro     = true;
-        planName  = sub.items.data[0]?.price?.nickname || (sub.status === 'trialing' ? 'Pro Trial' : 'Pro');
-        renewsAt  = new Date(sub.current_period_end * 1000).toISOString();
-        console.log(`✅ Pro confirmed for ${email} (${sub.status})`);
+      const subs = await stripe.subscriptions.list({
+        customer: user.stripe_customer,
+        status:   'active',
+        limit:    1,
+      });
+      if (subs.data.length > 0) {
+        const sub  = subs.data[0];
+        isPro      = true;
+        planName   = sub.items.data[0]?.price?.nickname || 'Pro';
+        renewsAt   = new Date(sub.current_period_end * 1000).toISOString();
       }
     }
   } catch(e) {
     console.warn('Stripe check failed:', e.message);
     // Fall back to cached DB value
     isPro = user.is_pro === 1;
-  }
-
-  // Also trust DB flag as fallback (set by webhook)
-  if (!isPro && user.is_pro === 1) {
-    isPro = true;
-    console.log(`✅ Pro from DB cache for ${email}`);
   }
 
   // Update DB cache

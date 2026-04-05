@@ -1337,8 +1337,9 @@ body::before {
       <svg width="16" height="16" viewBox="0 0 60 25" fill="none"><path d="M5 10.5c0-1.7 1.4-2.4 3.6-2.4 3.2 0 7.3 1 10.4 2.7V4.4C16 2.8 13.1 2 10 2 4.3 2 .5 5 .5 10.7c0 8.7 12 7.3 12 11.1 0 2-1.8 2.7-4.2 2.7-3.6 0-8.2-1.5-11.8-3.5v6.5C-.5 29 2.5 30 6 30c5.8 0 9.8-3 9.8-8.6-.1-9.4-11.9-7.9-11.9-11.4zm18.6-8L19 4l-4 .8V29h5.6V13.7l3.5 5.5h.1l3.5-5.5V29H33V4.8l-4-.8-4.9 5.6V2.5h-.1zm18.2 5.4c-2.5 0-4.2 1.2-5.3 2l-.3-1.6H31v28l5.6-1.2v-6.8c1 .7 2.5 1.7 5 1.7 5 0 9.6-4 9.6-12.9-.1-8.1-4.7-11.2-9.4-11.2zm-1.7 17.3c-1.7 0-2.7-.6-3.4-1.4V16c.7-.8 1.8-1.4 3.4-1.4 2.6 0 4.4 2.9 4.4 6.3 0 3.5-1.8 6.3-4.4 6.3z" fill="white"/></svg>
       UPGRADE TO PRO — START FREE TRIAL
     </button>
+    <div class="pro-close" id="pro-skip-btn">Maybe later · continue with free access</div>
     <div style="text-align:center;padding-bottom:14px;font-family:'Share Tech Mono',monospace;font-size:8px;color:#253060">
-      Secure payment powered by Stripe · Cancel anytime · 7-day free trial
+      Secure payment powered by Stripe · Cancel anytime
     </div>
   </div>
 </div>
@@ -6362,6 +6363,9 @@ const AUTH = {
     const skipBtn = document.getElementById('auth-skip-btn');
     if (skipBtn) skipBtn.addEventListener('click', AUTH.dismiss);
 
+    const proSkip = document.getElementById('pro-skip-btn');
+    if (proSkip) proSkip.addEventListener('click', AUTH.dismiss);
+
     const stripeBtn = document.getElementById('stripe-checkout-btn');
     if (stripeBtn) stripeBtn.addEventListener('click', AUTH.startStripeCheckout);
 
@@ -6392,113 +6396,91 @@ const AUTH = {
 
   // ── Trigger Google sign-in ────────────────────────────────
   triggerGoogleSignIn() {
+    // file:// mode → demo login
     if (window.location.protocol === 'file:') {
-      AUTH._handleMockLogin(); return;
+      AUTH._handleMockLogin();
+      return;
     }
 
-    const isMobile = /iPhone|iPad|iPod|Android|webOS/i.test(navigator.userAgent);
+    // Detect mobile — GSI One-Tap popup doesn't work on mobile browsers
+    const isMobile = /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
-    // Always try GSI One-Tap first on desktop
-    if (!isMobile && typeof google !== 'undefined' && google?.accounts?.id) {
+    if (isMobile) {
+      // Use full OAuth redirect flow for mobile
+      AUTH._googleRedirectFlow();
+      return;
+    }
+
+    // Desktop: try GSI One-Tap prompt
+    if (typeof google !== 'undefined' && google?.accounts?.id) {
       try {
-        google.accounts.id.prompt(note => {
-          // If One-Tap is suppressed, fall back to popup
-          if (note.isSkippedMoment() || note.isDismissedMoment()) {
-            AUTH._googlePopupFlow();
+        google.accounts.id.prompt(notification => {
+          // If One-Tap is suppressed (user dismissed before, browser blocks popups etc.)
+          // fall back to redirect flow
+          if (notification.isSkippedMoment() || notification.isDismissedMoment()) {
+            AUTH._googleRedirectFlow();
           }
         });
         return;
-      } catch(e) { /* fall through */ }
+      } catch(e) {
+        console.warn('GSI prompt failed:', e.message);
+      }
     }
 
-    // Mobile or GSI unavailable → use popup window (works on all browsers)
-    AUTH._googlePopupFlow();
+    // Final fallback
+    AUTH._googleRedirectFlow();
   },
 
-  // ── Google popup window flow ──────────────────────────────
-  // Opens a small popup, user signs in, popup calls back to parent
-  _googlePopupFlow() {
-    const clientId   = AUTH_CONFIG.GOOGLE_CLIENT_ID;
-    const origin     = window.location.origin;
-    // Redirect back to same page — no special callback route needed
-    const redirectUri = encodeURIComponent(origin);
+  // ── Google OAuth redirect flow (works on all browsers/mobile) ──
+  _googleRedirectFlow() {
+    const clientId    = AUTH_CONFIG.GOOGLE_CLIENT_ID;
+    const redirectUri = encodeURIComponent(window.location.origin + '/auth/google/callback');
     const scope       = encodeURIComponent('openid email profile');
-    const nonce       = Math.random().toString(36).slice(2);
-    const state       = btoa(JSON.stringify({ nonce, ts: Date.now() }));
+    const state       = btoa(JSON.stringify({ ts: Date.now(), nonce: Math.random() }));
+
+    // Save state for verification on return
     try { sessionStorage.setItem('gauth_state', state); } catch(e) {}
 
-    // Use implicit id_token flow — returns token in URL fragment
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth`
-      + `?client_id=${clientId}`
-      + `&redirect_uri=${redirectUri}`
-      + `&response_type=id_token`
-      + `&scope=${scope}`
-      + `&state=${encodeURIComponent(state)}`
-      + `&nonce=${nonce}`
-      + `&prompt=select_account`;
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth` +
+      `?client_id=${clientId}` +
+      `&redirect_uri=${redirectUri}` +
+      `&response_type=token id_token` +
+      `&scope=${scope}` +
+      `&state=${encodeURIComponent(state)}` +
+      `&nonce=${Math.random().toString(36).slice(2)}` +
+      `&prompt=select_account`;
 
-    const isMobile = /iPhone|iPad|iPod|Android|webOS/i.test(navigator.userAgent);
-
-    if (isMobile) {
-      // Mobile: full redirect (popup blocked on iOS/Android)
-      window.location.href = authUrl;
-    } else {
-      // Desktop: open small popup
-      const w = 480, h = 600;
-      const left = (screen.width  - w) / 2;
-      const top  = (screen.height - h) / 2;
-      const popup = window.open(authUrl, 'google_auth',
-        `width=${w},height=${h},left=${left},top=${top},toolbar=no,location=no`);
-
-      if (!popup) {
-        // Popup blocked → fall back to redirect
-        window.location.href = authUrl;
-        return;
-      }
-
-      // Poll for redirect back to our origin
-      const timer = setInterval(() => {
-        try {
-          if (!popup || popup.closed) { clearInterval(timer); return; }
-          const hash = popup.location.hash;
-          if (popup.location.origin === window.location.origin && hash) {
-            clearInterval(timer);
-            popup.close();
-            AUTH._parseTokenFromHash(hash);
-          }
-        } catch(e) { /* cross-origin, still on Google's page */ }
-      }, 300);
-    }
+    window.location.href = authUrl;
   },
 
-  // ── Handle OAuth redirect callback (mobile full redirect) ─
+  // ── Handle OAuth redirect callback (called on page load) ─
   _handleOAuthCallback() {
+    // Check URL hash for OAuth token (implicit flow returns #access_token=...&id_token=...)
     const hash = window.location.hash;
     if (!hash || !hash.includes('id_token=')) return;
-    // Clean URL first
-    window.history.replaceState({}, document.title,
-      window.location.pathname + window.location.search);
-    AUTH._parseTokenFromHash(hash);
-  },
 
-  // ── Parse id_token from URL hash ─────────────────────────
-  _parseTokenFromHash(hash) {
     try {
-      const params  = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+      const params  = new URLSearchParams(hash.slice(1));
       const idToken = params.get('id_token');
       if (!idToken) return;
+
+      // Decode JWT payload
       const parts   = idToken.split('.');
       const payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
-      AUTH._signInComplete({
-        name:    payload.name  || payload.email,
+      const user = {
+        name:    payload.name    || payload.email,
         email:   payload.email,
         picture: payload.picture || '',
         token:   idToken,
-      });
-      addAlert('success', `✅ Signed in as ${payload.name || payload.email}`);
+      };
+
+      // Clean the hash from URL
+      window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+
+      AUTH._signInComplete(user);
+      addAlert('success', `✅ Signed in as ${user.name}`);
     } catch(e) {
-      console.warn('Token parse error:', e.message);
-      addAlert('warn', '⚠️ Sign-in failed — please try again');
+      console.warn('OAuth callback parse error:', e.message);
     }
   },
 
@@ -6546,13 +6528,12 @@ const AUTH = {
       AUTH._applyUserUI();
       AUTH.dismiss();
 
-      // ── Repeat Pro upgrade modal every 20s until they subscribe ──
+      // ── Start 30s timer to show Pro upgrade modal ──────
       if (!AUTH.isPro) {
-        clearInterval(AUTH.timers.pro);
-        AUTH.timers.pro = setInterval(() => {
-          if (!AUTH.isPro) AUTH.showProModal();
-          else clearInterval(AUTH.timers.pro);
-        }, 20000);
+        clearTimeout(AUTH.timers.pro);
+        AUTH.timers.pro = setTimeout(() => {
+          AUTH.showProModal();
+        }, 30000);
       }
     });
   },
@@ -6602,9 +6583,6 @@ const AUTH = {
     if (AUTH.isPro) {
       pill.classList.add('pro');
       if (proTag) proTag.style.display = '';
-      // Stop the upgrade modal from appearing
-      clearInterval(AUTH.timers.pro);
-      AUTH.dismiss();
     } else {
       pill.classList.remove('pro');
       if (proTag) proTag.style.display = 'none';
@@ -6731,14 +6709,17 @@ const AUTH = {
   },
 };
 
-// ── Backdrop: clicking outside does NOT dismiss either modal ──
-// Login modal: user must choose Google or Skip
-// Pro modal: user must upgrade or wait — no escape
+// ── Backdrop: clicking OUTSIDE modal card dismisses, but NOT login/pro which are required ──
 document.addEventListener('DOMContentLoaded', () => {
   const bd = document.getElementById('auth-backdrop');
   if (bd) bd.addEventListener('click', e => {
-    // Ignore all backdrop clicks — modals are intentionally persistent
-    e.stopPropagation();
+    // Only dismiss if clicking the backdrop itself (not a child modal)
+    if (e.target !== bd) return;
+    // Allow dismiss only for pro modal (not for initial login prompt)
+    const loginModal = document.getElementById('auth-login-modal');
+    const isLoginVisible = loginModal && loginModal.style.display !== 'none';
+    if (!isLoginVisible) AUTH.dismiss(); // pro modal can be dismissed by backdrop click
+    // Login modal: user must explicitly choose Google or Skip — no accidental dismiss
   });
 });
 

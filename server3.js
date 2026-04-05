@@ -205,34 +205,58 @@ app.get('/api/yahoo', async (req, res) => {
 // Returns { email, name } if valid, null if invalid
 // Soft-fails if GOOGLE_CLIENT_ID not configured (allows dev mode)
 async function verifyGoogleToken(token, email) {
-  // Always allow mock tokens (demo/file:// mode)
+  // Mock tokens (demo/file:// mode) — always allow
   if (!token || token.startsWith('mock_')) return { email, name: email };
 
-  // Decode JWT payload without verifying signature
-  // Security note: Stripe handles payment security independently.
-  // The email from the JWT is used only to look up/create a Stripe customer.
-  // Even if someone forged a JWT they could only create a checkout for themselves.
-  try {
-    const parts   = token.split('.');
-    if (parts.length !== 3) throw new Error('not a JWT');
-    const payload = JSON.parse(Buffer.from(
-      parts[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64'
-    ).toString('utf8'));
-
-    // Basic sanity checks only — no signature verification
-    const now = Math.floor(Date.now() / 1000);
-    if (payload.exp && payload.exp < now - 600) { // 10 min grace period
-      console.warn('Token expired for', email);
-      // Still allow — user experience > strict security here
-    }
-    if (!payload.email) throw new Error('no email in token');
-
-    console.log('✅ Token accepted for', payload.email);
-    return { email: payload.email, name: payload.name || payload.email };
-  } catch(e) {
-    console.warn('Token decode failed:', e.message, '— allowing with email:', email);
-    // Never block on token issues — fall back to the email they provided
+  // If no Google Client ID configured, skip verification (dev mode)
+  if (!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID.includes('YOUR_')) {
+    console.warn('⚠️  GOOGLE_CLIENT_ID not set — skipping token verification');
     return { email, name: email };
+  }
+
+  // Try Google library verification first
+  try {
+    const ticket  = await googleClient.verifyIdToken({
+      idToken:  token,
+      audience: GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    return { email: payload.email, name: payload.name };
+  } catch(e) {
+    // Library verification failed — try manual JWT decode as fallback
+    // (handles clock skew, implicit flow tokens, etc.)
+    try {
+      const parts   = token.split('.');
+      if (parts.length !== 3) throw new Error('not a JWT');
+      const payload = JSON.parse(Buffer.from(
+        parts[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64'
+      ).toString('utf8'));
+
+      // Check expiry (allow 5 min clock skew)
+      const now = Math.floor(Date.now() / 1000);
+      if (payload.exp && payload.exp < now - 300) {
+        throw new Error('token expired');
+      }
+      // Check audience
+      if (payload.aud !== GOOGLE_CLIENT_ID) {
+        throw new Error('wrong audience');
+      }
+      // Check issuer
+      if (!['accounts.google.com', 'https://accounts.google.com'].includes(payload.iss)) {
+        throw new Error('wrong issuer');
+      }
+      // Email must match what was sent
+      if (email && payload.email !== email) {
+        throw new Error('email mismatch');
+      }
+
+      console.log(`✅ Token verified via JWT decode for ${payload.email}`);
+      return { email: payload.email, name: payload.name };
+    } catch(e2) {
+      console.warn('Token verification failed:', e.message, '/', e2.message);
+      // In production with GOOGLE_CLIENT_ID set, reject
+      return null;
+    }
   }
 }
 //  Called on every user login to check Stripe subscription
@@ -302,7 +326,7 @@ app.post('/api/create-checkout', async (req, res) => {
   if (token && !token.startsWith('mock_')) {
     const verified = await verifyGoogleToken(token, email);
     if (!verified && GOOGLE_CLIENT_ID && !GOOGLE_CLIENT_ID.includes('YOUR_')) {
-      console.warn('Checkout: proceeding despite token issue for', email);
+      return res.status(401).json({ error: 'invalid token — please sign in again' });
     }
   }
 

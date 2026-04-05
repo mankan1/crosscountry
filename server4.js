@@ -370,27 +370,17 @@ app.post('/webhook', (req, res) => {
 
     // ── Checkout completed → activate pro ─────────────────
     case 'checkout.session.completed': {
-      const session = event.data.object;
-      const email   = session.metadata?.email
-                   || session.customer_details?.email
-                   || session.customer_email;
-      const subId   = session.subscription;
-      const custId  = session.customer;
-      console.log(`Checkout completed: email=${email} customer=${custId}`);
+      const session   = event.data.object;
+      const email     = session.metadata?.email || session.customer_email;
+      const subId     = session.subscription;
+      const custId    = session.customer;
       if (email) {
-        // UPSERT — works whether or not the user row exists yet
         db.prepare(`
-          INSERT INTO users (email, stripe_customer, subscription_id, is_pro, pro_since)
-          VALUES (?, ?, ?, 1, datetime('now'))
-          ON CONFLICT(email) DO UPDATE SET
-            stripe_customer = excluded.stripe_customer,
-            subscription_id = excluded.subscription_id,
-            is_pro          = 1,
-            pro_since       = datetime('now')
-        `).run(email, custId, subId);
+          UPDATE users
+          SET is_pro = 1, stripe_customer = ?, subscription_id = ?, pro_since = datetime('now')
+          WHERE email = ?
+        `).run(custId, subId, email);
         console.log(`✅ Pro activated for ${email}`);
-      } else {
-        console.warn('⚠️ checkout.session.completed: no email found in event');
       }
       break;
     }
@@ -411,21 +401,8 @@ app.post('/webhook', (req, res) => {
     case 'invoice.payment_succeeded': {
       const inv    = event.data.object;
       const custId = inv.customer;
-      const email  = inv.customer_email;
       if (custId && inv.subscription) {
-        if (email) {
-          db.prepare(`
-            INSERT INTO users (email, stripe_customer, subscription_id, is_pro)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(email) DO UPDATE SET
-              stripe_customer = excluded.stripe_customer,
-              subscription_id = excluded.subscription_id,
-              is_pro          = 1
-          `).run(email, custId, inv.subscription);
-        } else {
-          db.prepare('UPDATE users SET is_pro = 1 WHERE stripe_customer = ?').run(custId);
-        }
-        console.log(`✅ Subscription active for customer ${custId}`);
+        db.prepare('UPDATE users SET is_pro = 1 WHERE stripe_customer = ?').run(custId);
       }
       break;
     }

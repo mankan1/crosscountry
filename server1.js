@@ -22,12 +22,11 @@ const app = express();
 // ── Config from environment variables ─────────────────────
 const {
   STRIPE_SECRET_KEY,          // sk_live_... or sk_test_...
-  STRIPE_PUBLISHABLE_KEY,     // pk_live_... (injected into HTML at serve time)
   STRIPE_WEBHOOK_SECRET,      // whsec_...
   STRIPE_MONTHLY_PRICE_ID,    // price_...
   STRIPE_ANNUAL_PRICE_ID,     // price_...
   GOOGLE_CLIENT_ID,           // your-client-id.apps.googleusercontent.com
-  FRONTEND_URL,               // https://tradermind.lol
+  FRONTEND_URL,               // https://your-frontend.railway.app or file://
   PORT = 3000,
 } = process.env;
 
@@ -40,6 +39,7 @@ const stripe       = Stripe(STRIPE_SECRET_KEY);
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 // ── SQLite database (persists on Railway volume) ───────────
+// On Railway: add a Volume mounted at /data
 const DB_PATH = process.env.RAILWAY_VOLUME_MOUNT_PATH
   ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, 'users.db')
   : path.join(__dirname, 'users.db');
@@ -61,55 +61,36 @@ db.exec(`
 console.log(`✅ Database ready at ${DB_PATH}`);
 
 // ── Serve frontend HTML from /public folder ────────────────
+// Put livermore-copilot.html inside lp-backend/public/
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Root route — inject environment variables into the HTML at serve time
+// Root redirect → the HTML file
 app.get('/', (req, res) => {
   const htmlPath = path.join(__dirname, 'public', 'livermore-copilot.html');
   const fs = require('fs');
-  if (!fs.existsSync(htmlPath)) {
-    return res.json({
+  if (fs.existsSync(htmlPath)) {
+    res.sendFile(htmlPath);
+  } else {
+    res.json({
       status: 'ok',
       service: 'Livermore Co-Pilot Backend',
       time: new Date().toISOString(),
-      note: 'Put livermore-copilot.html in the public/ folder',
+      note: 'Put livermore-copilot.html in the public/ folder to serve the frontend',
     });
   }
-
-  let html = fs.readFileSync(htmlPath, 'utf8');
-
-  // Replace ALL placeholder variants at serve time
-  const replacements = [
-    ['YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com', GOOGLE_CLIENT_ID || ''],
-    ['pk_live_YOUR_STRIPE_PUBLISHABLE_KEY',              process.env.STRIPE_PUBLISHABLE_KEY || ''],
-    ['price_YOUR_MONTHLY_PRICE_ID',                     process.env.STRIPE_MONTHLY_PRICE_ID || ''],
-    ['price_YOUR_ANNUAL_PRICE_ID',                      process.env.STRIPE_ANNUAL_PRICE_ID  || ''],
-    ['https://your-backend.railway.app',                FRONTEND_URL || `https://${req.hostname}`],
-    ['https://crosscountry-production.up.railway.app',  FRONTEND_URL || `https://${req.hostname}`],
-  ];
-  for (const [from, to] of replacements) {
-    if (to) html = html.split(from).join(to);
-  }
-
-  res.setHeader('Content-Type', 'text/html');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.send(html);
 });
 
-// ── CORS — allow all your domains ──────────────────────────
+// ── CORS — allow your frontend domain ──────────────────────
 const allowedOrigins = [
-  'https://tradermind.lol',
-  'https://www.tradermind.lol',
-  'https://crosscountry-production.up.railway.app',
-  'https://www.crosscountry-production.up.railway.app',
   FRONTEND_URL,
   'http://localhost:3000',
   'http://localhost:5500',
-  'null',
+  'null',           // file:// origin
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, cb) => {
+    // Allow requests with no origin (file://, Postman) or matching origins
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error('CORS: not allowed — ' + origin));
   },
@@ -120,85 +101,9 @@ app.use(cors({
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// ── Google OAuth redirect callback ────────────────────────
-// Mobile uses redirect flow — Google sends back to this URL
-// with the id_token in the URL hash (handled client-side)
-// This route just serves the HTML so the JS can parse the hash
-app.get('/auth/google/callback', (req, res) => {
-  const htmlPath = path.join(__dirname, 'public', 'livermore-copilot.html');
-  const fs = require('fs');
-  if (fs.existsSync(htmlPath)) {
-    let html = fs.readFileSync(htmlPath, 'utf8');
-    const replacements = [
-      ['YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com', GOOGLE_CLIENT_ID || ''],
-      ['pk_live_YOUR_STRIPE_PUBLISHABLE_KEY', process.env.STRIPE_PUBLISHABLE_KEY || ''],
-      ['price_YOUR_MONTHLY_PRICE_ID', process.env.STRIPE_MONTHLY_PRICE_ID || ''],
-      ['price_YOUR_ANNUAL_PRICE_ID',  process.env.STRIPE_ANNUAL_PRICE_ID  || ''],
-    ];
-    for (const [from, to] of replacements) {
-      if (to) html = html.split(from).join(to);
-    }
-    res.setHeader('Content-Type', 'text/html');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.send(html);
-  } else {
-    res.redirect('/');
-  }
-});
-
 // ── Health check (API only) ────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Livermore Co-Pilot Backend', time: new Date().toISOString() });
-});
-
-// ══════════════════════════════════════════════════════════
-//  GET /api/yahoo?symbol=ES%3DF&interval=30m&range=2d
-//  Server-side proxy for Yahoo Finance — avoids all CORS
-//  issues. The HTML calls this instead of Yahoo directly.
-//  Railway's server has no CORS restrictions fetching Yahoo.
-// ══════════════════════════════════════════════════════════
-app.get('/api/yahoo', async (req, res) => {
-  const https  = require('https');
-  const symbol   = req.query.symbol   || 'ES%3DF';
-  const interval = req.query.interval || '30m';
-  const range    = req.query.range    || '2d';
-
-  const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}` +
-    `?interval=${interval}&range=${range}&includePrePost=false`;
-
-  try {
-    const data = await new Promise((resolve, reject) => {
-      const options = {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          'Accept': 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://finance.yahoo.com',
-        },
-      };
-      https.get(yfUrl, options, (yRes) => {
-        let body = '';
-        yRes.on('data', chunk => body += chunk);
-        yRes.on('end', () => {
-          try { resolve({ status: yRes.statusCode, body: JSON.parse(body) }); }
-          catch(e) { reject(new Error('JSON parse failed: ' + body.slice(0, 200))); }
-        });
-      }).on('error', reject);
-    });
-
-    if (data.status !== 200) {
-      return res.status(data.status).json({ error: 'Yahoo Finance returned ' + data.status });
-    }
-
-    // Cache for 30 seconds (one candle period)
-    res.setHeader('Cache-Control', 'public, max-age=30');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.json(data.body);
-
-  } catch(e) {
-    console.error('Yahoo proxy error:', e.message);
-    res.status(502).json({ error: 'Yahoo Finance unavailable: ' + e.message });
-  }
 });
 
 // ══════════════════════════════════════════════════════════

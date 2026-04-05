@@ -1286,7 +1286,7 @@ body::before {
     </div>
     <button class="auth-google-btn" id="auth-google-btn">
       <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 002.38-5.88c0-.57-.05-.66-.15-1.18z"/><path fill="#34A853" d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2a4.8 4.8 0 01-7.18-2.54H1.83v2.07A8 8 0 008.98 17z"/><path fill="#FBBC05" d="M4.5 10.52a4.8 4.8 0 010-3.04V5.41H1.83a8 8 0 000 7.18l2.67-2.07z"/><path fill="#EA4335" d="M8.98 4.18c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 001.83 5.4L4.5 7.49a4.77 4.77 0 014.48-3.31z"/></svg>
-      <span id="auth-google-btn-text">Sign in with Google</span>
+      Sign in with Google
     </button>
     <div class="auth-divider">OR</div>
     <span class="auth-skip" id="auth-skip-btn">Continue without signing in (limited access)</span>
@@ -2526,27 +2526,25 @@ function renderLearnedPatterns() {
 //  4. Fall back to realistic simulation with proper market hours
 // ══════════════════════════════════════════════════════════
 
-// ── Yahoo Finance data fetch ───────────────────────────────
-// Strategy 1: Our own Railway backend proxy (always works, no CORS)
-// Strategy 2: Third-party proxies as fallback
-// Strategy 3: Realistic simulation anchored to last known price
+// Targets — ES=F is E-mini S&P 500 continuous futures
+const YF_CHART  = 'https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF?interval=30m&range=2d&includePrePost=false';
+const YF_CHART2 = 'https://query2.finance.yahoo.com/v8/finance/chart/ES%3DF?interval=30m&range=2d&includePrePost=false';
+const YF_QUOTE  = 'https://query1.finance.yahoo.com/v7/finance/quote?symbols=ES%3DF&fields=regularMarketPrice,regularMarketChange,regularMarketOpen,regularMarketDayHigh,regularMarketDayLow';
+const YF_SPARK  = 'https://query1.finance.yahoo.com/v8/finance/spark?symbols=ES%3DF&range=1d&interval=30m';
 
-// ── Backend origin — always same host when served from Railway ──
-// tradermind.lol serves HTML + API from same Railway app,
-// so all API calls go to the same origin (no CORS issues).
-const BACKEND_ORIGIN = (() => {
-  // If served over HTTPS (production), use same origin
-  if (window.location.protocol === 'https:') return window.location.origin;
-  // Local dev: explicit backend URL if set
-  if (AUTH_CONFIG.BACKEND_URL && AUTH_CONFIG.BACKEND_URL.length > 5) return AUTH_CONFIG.BACKEND_URL;
-  return null;
-})();
-
-// Third-party CORS proxies (fallback only)
+// 8 CORS proxies — tried in fast parallel race, first success wins
 const PROXIES = [
-  raw => ({ url: `https://corsproxy.io/?url=${encodeURIComponent(raw)}` }),
+  // proxy.cors.sh — modern, no rate limit on GET
+  raw => ({ url: `https://proxy.cors.sh/${raw}`,
+            headers: { 'x-cors-api-key': 'temp_' + Math.random() } }),
+  // Cloudflare worker public proxies
+  raw => ({ url: `https://cors.eu.org/${raw}` }),
+  raw => ({ url: `https://api.allorigins.win/get?url=${encodeURIComponent(raw)}`,
+            isAllOrigins: true }),
   raw => ({ url: `https://api.allorigins.win/raw?url=${encodeURIComponent(raw)}` }),
-  raw => ({ url: `https://api.allorigins.win/get?url=${encodeURIComponent(raw)}`, isAllOrigins: true }),
+  raw => ({ url: `https://corsproxy.io/?url=${encodeURIComponent(raw)}` }),
+  raw => ({ url: `https://cors-proxy.fringe.zone/${raw}` }),
+  raw => ({ url: `https://yacdn.org/proxy/${raw}` }),
   raw => ({ url: `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(raw)}` }),
 ];
 
@@ -2558,6 +2556,7 @@ async function tryProxy(proxyFn, targetUrl) {
   });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   let json = await resp.json();
+  // allorigins /get wraps in { contents: "..." }
   if (isAllOrigins && json.contents) json = JSON.parse(json.contents);
   return json;
 }
@@ -2566,48 +2565,56 @@ async function fetchESData() {
   if (STATE.refreshing) return;
   STATE.refreshing = true;
 
+  // Update UI to show we're trying
   const statusEl = document.getElementById('data-status');
   const ledEl    = document.getElementById('led-data');
   if (statusEl) statusEl.textContent = 'FETCHING…';
 
   let data = null;
 
-  // ── Strategy 1: Own Railway backend proxy ──────────────
-  // No CORS issues, server-to-server fetch, always works
-  if (BACKEND_ORIGIN) {
-    try {
-      const url  = `${BACKEND_ORIGIN}/api/yahoo?symbol=ES%3DF&interval=30m&range=2d`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if (resp.ok) {
-        const json = await resp.json();
-        if (json?.chart?.result?.[0]) {
-          data = json;
-          console.log('✅ Yahoo Finance via Railway backend proxy');
-        }
-      }
-    } catch(e) {
-      console.warn('Backend proxy failed:', e.message);
-    }
+  // ── Strategy 1: Race all 8 proxies in parallel ──────────
+  const raceResults = await Promise.allSettled(
+    PROXIES.flatMap(proxyFn => [
+      tryProxy(proxyFn, YF_CHART),
+      tryProxy(proxyFn, YF_CHART2),
+    ]).map(p => p.then(json => {
+      if (json?.chart?.result?.[0]) return json;
+      throw new Error('no chart data');
+    }))
+  );
+
+  for (const r of raceResults) {
+    if (r.status === 'fulfilled') { data = r.value; break; }
   }
 
-  // ── Strategy 2: Third-party proxies (fallback) ─────────
+  // ── Strategy 2: Try v7 quote for price at least ─────────
   if (!data) {
-    const YF_RAW = 'https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF?interval=30m&range=2d&includePrePost=false';
-    const results = await Promise.allSettled(
-      PROXIES.map(fn => tryProxy(fn, YF_RAW).then(json => {
-        if (json?.chart?.result?.[0]) return json;
-        throw new Error('no chart data');
-      }))
-    );
-    for (const r of results) {
-      if (r.status === 'fulfilled') { data = r.value; break; }
+    for (const proxyFn of PROXIES.slice(0, 4)) {
+      try {
+        const json = await tryProxy(proxyFn, YF_QUOTE);
+        // v7 quote has different shape
+        const result = json?.quoteResponse?.result?.[0];
+        if (result?.regularMarketPrice) {
+          // Build minimal synthetic data from quote
+          STATE.lastPrice  = result.regularMarketPrice;
+          STATE.prevPrice  = result.regularMarketPrice - (result.regularMarketChange || 0);
+          if (statusEl) statusEl.textContent = 'QUOTE ONLY';
+          if (ledEl) { ledEl.style.background = 'var(--amber)'; ledEl.style.boxShadow = '0 0 6px var(--amber)'; }
+          addAlert('warn', `⚠️ Chart unavailable — got quote price: ${result.regularMarketPrice.toFixed(2)}`);
+          generateSimData(); // use quote price as anchor for sim
+          STATE.refreshing = false;
+          return;
+        }
+      } catch(e) { /* next */ }
     }
   }
 
-  // ── Strategy 3: JSONP script tag ──────────────────────
-  if (!data) data = await tryScriptTagFetch();
+  // ── Strategy 3: Script-tag JSONP injection ───────────────
+  if (!data) {
+    data = await tryScriptTagFetch();
+  }
 
-  // ── Process or fall back to simulation ────────────────
+  // ── Process or simulate ──────────────────────────────────
   if (data) {
     processYahooData(data);
     if (statusEl) statusEl.textContent = 'LIVE DATA';
@@ -2618,7 +2625,8 @@ async function fetchESData() {
     if (statusEl) statusEl.textContent = 'SIMULATED';
     if (ledEl) { ledEl.style.background = 'var(--amber)'; ledEl.style.boxShadow = '0 0 6px var(--amber)'; }
     if (wasFirst) {
-      addAlert('warn', '⚠️ Live /ES unavailable. Using realistic simulation. Data refreshes every 60s.');
+      addAlert('warn', '⚠️ All 8 CORS proxies blocked. Using realistic /ES simulation. Data refreshes every 60s.');
+      addAlert('info', '💡 TIP: Deploy to a server (not file://) for live data via Railway or Vercel.');
     }
   }
 
@@ -6276,6 +6284,7 @@ function boot() {
   // ── Auth: start timers and restore session ─────────────
   setTimeout(() => {
     AUTH.init();
+    AUTH._checkStripeRedirect();
   }, 0);
 }
 
@@ -6292,13 +6301,13 @@ function boot() {
 //  deploy to Railway/Vercel for full production auth.
 // ══════════════════════════════════════════════════════════
 const AUTH_CONFIG = {
-  GOOGLE_CLIENT_ID:       '192794540032-147c1ms1vlpt4m6oekepfblvv8sd0sp9.apps.googleusercontent.com',
+  GOOGLE_CLIENT_ID:       '192794540032-pcvc81s8tufhsnmfiqer25hj8uqt3mdc.apps.googleusercontent.com',
   STRIPE_PUBLISHABLE_KEY: 'pk_live_YOUR_STRIPE_PUBLISHABLE_KEY',
   STRIPE_MONTHLY_PRICE:   'price_YOUR_MONTHLY_PRICE_ID',
   STRIPE_ANNUAL_PRICE:    'price_YOUR_ANNUAL_PRICE_ID',
   // Backend endpoint for Stripe Checkout session creation
   // Deploy the included server snippet to Railway/Vercel
-  BACKEND_URL:            '', // auto-detected from window.location.origin at runtime
+  BACKEND_URL:            'https://crosscountry-production.up.railway.app',
 };
 
 const AUTH = {
@@ -6327,15 +6336,6 @@ const AUTH = {
         AUTH._checkProStatus();
       }
     } catch(e) {}
-
-    // ── Handle OAuth redirect callback (mobile sign-in return) ─
-    AUTH._handleOAuthCallback();
-    AUTH._checkStripeRedirect();
-
-    // Show mobile-appropriate button text
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-    const btnText  = document.getElementById('auth-google-btn-text');
-    if (btnText && isMobile) btnText.textContent = 'Continue with Google →';
 
     // Record first-seen timestamp
     if (!localStorage.getItem(AUTH.STORAGE.SEEN_AT)) {
@@ -6394,93 +6394,22 @@ const AUTH = {
     setTimeout(tryInit, 300);
   },
 
-  // ── Trigger Google sign-in ────────────────────────────────
+  // ── Trigger Google sign-in popup ──────────────────────
   triggerGoogleSignIn() {
-    // file:// mode → demo login
+    // File:// fallback — in production this opens Google OAuth
     if (window.location.protocol === 'file:') {
+      // Demo mode: simulate a successful login with a mock user
       AUTH._handleMockLogin();
       return;
     }
-
-    // Detect mobile — GSI One-Tap popup doesn't work on mobile browsers
-    const isMobile = /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-
-    if (isMobile) {
-      // Use full OAuth redirect flow for mobile
-      AUTH._googleRedirectFlow();
-      return;
-    }
-
-    // Desktop: try GSI One-Tap prompt
-    if (typeof google !== 'undefined' && google?.accounts?.id) {
+    if (typeof google !== 'undefined' && google.accounts) {
       try {
-        google.accounts.id.prompt(notification => {
-          // If One-Tap is suppressed (user dismissed before, browser blocks popups etc.)
-          // fall back to redirect flow
-          if (notification.isSkippedMoment() || notification.isDismissedMoment()) {
-            AUTH._googleRedirectFlow();
-          }
-        });
-        return;
+        google.accounts.id.prompt();
       } catch(e) {
-        console.warn('GSI prompt failed:', e.message);
+        AUTH._handleMockLogin();
       }
-    }
-
-    // Final fallback
-    AUTH._googleRedirectFlow();
-  },
-
-  // ── Google OAuth redirect flow (works on all browsers/mobile) ──
-  _googleRedirectFlow() {
-    const clientId    = AUTH_CONFIG.GOOGLE_CLIENT_ID;
-    const redirectUri = encodeURIComponent(window.location.origin + '/auth/google/callback');
-    const scope       = encodeURIComponent('openid email profile');
-    const state       = btoa(JSON.stringify({ ts: Date.now(), nonce: Math.random() }));
-
-    // Save state for verification on return
-    try { sessionStorage.setItem('gauth_state', state); } catch(e) {}
-
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth` +
-      `?client_id=${clientId}` +
-      `&redirect_uri=${redirectUri}` +
-      `&response_type=token id_token` +
-      `&scope=${scope}` +
-      `&state=${encodeURIComponent(state)}` +
-      `&nonce=${Math.random().toString(36).slice(2)}` +
-      `&prompt=select_account`;
-
-    window.location.href = authUrl;
-  },
-
-  // ── Handle OAuth redirect callback (called on page load) ─
-  _handleOAuthCallback() {
-    // Check URL hash for OAuth token (implicit flow returns #access_token=...&id_token=...)
-    const hash = window.location.hash;
-    if (!hash || !hash.includes('id_token=')) return;
-
-    try {
-      const params  = new URLSearchParams(hash.slice(1));
-      const idToken = params.get('id_token');
-      if (!idToken) return;
-
-      // Decode JWT payload
-      const parts   = idToken.split('.');
-      const payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
-      const user = {
-        name:    payload.name    || payload.email,
-        email:   payload.email,
-        picture: payload.picture || '',
-        token:   idToken,
-      };
-
-      // Clean the hash from URL
-      window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
-
-      AUTH._signInComplete(user);
-      addAlert('success', `✅ Signed in as ${user.name}`);
-    } catch(e) {
-      console.warn('OAuth callback parse error:', e.message);
+    } else {
+      AUTH._handleMockLogin();
     }
   },
 
@@ -6541,9 +6470,8 @@ const AUTH = {
   // ── Check pro status from backend ────────────────────
   async _checkProStatus() {
     if (!AUTH.user) return;
-    const backend = (typeof BACKEND_ORIGIN !== 'undefined' && BACKEND_ORIGIN) || window.location.origin;
     try {
-      const resp = await fetch(`${backend}/api/pro-status`, {
+      const resp = await fetch(`${AUTH_CONFIG.BACKEND_URL}/api/pro-status`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ email: AUTH.user.email, token: AUTH.user.token }),
@@ -6556,6 +6484,7 @@ const AUTH = {
         AUTH._applyProUI();
       }
     } catch(e) {
+      // Backend not reachable (file:// mode or not deployed) — keep cached status
       AUTH.isPro = localStorage.getItem(AUTH.STORAGE.PRO) === 'true';
     }
   },
@@ -6643,9 +6572,9 @@ const AUTH = {
       ? AUTH_CONFIG.STRIPE_ANNUAL_PRICE
       : AUTH_CONFIG.STRIPE_MONTHLY_PRICE;
 
-    const backend = (typeof BACKEND_ORIGIN !== 'undefined' && BACKEND_ORIGIN) || window.location.origin;
     try {
-      const resp = await fetch(`${backend}/api/create-checkout`, {
+      // Create Stripe Checkout Session via your backend
+      const resp = await fetch(`${AUTH_CONFIG.BACKEND_URL}/api/create-checkout`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({
@@ -6709,17 +6638,11 @@ const AUTH = {
   },
 };
 
-// ── Backdrop: clicking OUTSIDE modal card dismisses, but NOT login/pro which are required ──
+// ── Backdrop click to dismiss ──────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   const bd = document.getElementById('auth-backdrop');
   if (bd) bd.addEventListener('click', e => {
-    // Only dismiss if clicking the backdrop itself (not a child modal)
-    if (e.target !== bd) return;
-    // Allow dismiss only for pro modal (not for initial login prompt)
-    const loginModal = document.getElementById('auth-login-modal');
-    const isLoginVisible = loginModal && loginModal.style.display !== 'none';
-    if (!isLoginVisible) AUTH.dismiss(); // pro modal can be dismissed by backdrop click
-    // Login modal: user must explicitly choose Google or Skip — no accidental dismiss
+    if (e.target === bd) AUTH.dismiss();
   });
 });
 
@@ -6926,59 +6849,46 @@ function trYourMistake(candles, idx) {
 
 // ── Fetch real Yahoo Finance data for trainer ─────────────
 async function trFetchRealData() {
-  const days    = parseInt(document.getElementById('tr-range-sel')?.value||'1095');
-  const tf      = document.getElementById('tr-tf-sel')?.value || '30m';
-  const yfRange = days <= 90 ? '3mo' : days <= 180 ? '6mo' : days <= 365 ? '1y' : '3y';
+  const days     = parseInt(document.getElementById('tr-range-sel')?.value||'1095');
+  const tf       = document.getElementById('tr-tf-sel')?.value || '30m';
+  const yfRange  = days <= 90 ? '3mo' : days <= 180 ? '6mo' : days <= 365 ? '1y' : '3y';
+  const yfUrl    = `https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF?interval=${tf}&range=${yfRange}&includePrePost=false`;
 
-  // Helper: parse Yahoo chart JSON into candle array
-  const parseYFJson = (json) => {
-    const res = json?.chart?.result?.[0];
-    if (!res) return null;
-    const ts = res.timestamp || [];
-    const q  = res.indicators.quote[0];
-    const candles = [];
-    for (let i = 0; i < ts.length; i++) {
-      if (!q.close[i]) continue;
-      candles.push({
-        time: new Date(ts[i]*1000),
-        open: q.open[i], high: q.high[i],
-        low:  q.low[i],  close: q.close[i],
-        volume: q.volume[i]||0, real: true,
-      });
-    }
-    return candles.length > 10 ? candles : null;
-  };
-
-  // ── Strategy 1: Own Railway backend (no CORS, always works) ──
-  if (BACKEND_ORIGIN) {
-    try {
-      const url  = `${BACKEND_ORIGIN}/api/yahoo?symbol=ES%3DF&interval=${tf}&range=${yfRange}`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(12000) });
-      if (resp.ok) {
-        const candles = parseYFJson(await resp.json());
-        if (candles) { console.log('✅ Trainer: Yahoo via Railway'); return candles; }
-      }
-    } catch(e) { console.warn('Trainer backend proxy failed:', e.message); }
-  }
-
-  // ── Strategy 2: Third-party proxies ──────────────────────
-  const yfUrl  = `https://query1.finance.yahoo.com/v8/finance/chart/ES%3DF?interval=${tf}&range=${yfRange}&includePrePost=false`;
   const proxies = [
     raw => `https://corsproxy.io/?url=${encodeURIComponent(raw)}`,
     raw => `https://api.allorigins.win/raw?url=${encodeURIComponent(raw)}`,
+    raw => `https://cors.eu.org/${raw}`,
     raw => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(raw)}`,
   ];
-  for (const fn of proxies) {
+
+  for (const proxyFn of proxies) {
     try {
-      const resp = await fetch(fn(yfUrl), { signal: AbortSignal.timeout(10000) });
+      const resp = await fetch(proxyFn(yfUrl), { signal: AbortSignal.timeout(10000) });
       if (!resp.ok) continue;
       let json = await resp.json();
       if (json.contents) json = JSON.parse(json.contents);
-      const candles = parseYFJson(json);
-      if (candles) return candles;
-    } catch(e) { /* next */ }
+      const res = json?.chart?.result?.[0];
+      if (!res) continue;
+
+      const ts    = res.timestamp || [];
+      const q     = res.indicators.quote[0];
+      const candles = [];
+      for (let i=0; i<ts.length; i++) {
+        if (!q.close[i]) continue;
+        candles.push({
+          time:   new Date(ts[i]*1000),
+          open:   q.open[i],
+          high:   q.high[i],
+          low:    q.low[i],
+          close:  q.close[i],
+          volume: q.volume[i]||0,
+          real:   true,
+        });
+      }
+      if (candles.length > 10) return candles;
+    } catch(e) { /* next proxy */ }
   }
-  return null;
+  return null; // all proxies failed
 }
 
 // ── Generate realistic synthetic data as fallback ─────────
